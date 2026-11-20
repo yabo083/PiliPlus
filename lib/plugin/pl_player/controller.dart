@@ -926,8 +926,12 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     final Map<String, String> extras = {
       if (dataSource is FileSource)
         'cache': 'no'
-      else if (isLive) ...liveBuffer
-      else
+      else if (isLive) ...{
+        ...liveBuffer,
+        // 设备实测：关掉 hls 的持久连接后，分片请求结束即关闭，
+        // socket 不再随时间累积（代价是每分片一次握手）。
+        'demuxer-lavf-o': 'http_persistent=0',
+      } else
         ...buffer,
       'video-rotate': ?rotate?.toString(),
     };
@@ -1150,15 +1154,21 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
           return;
         }
         if (isLive) {
-          // mpv 会把 ffmpeg 的 error 级日志（TLS 读 EOF、单分片截断等）
-          // 转发到这里，绝大多数不代表整路已断；这里只记录信号，
-          // 是否真的断流由位置看门狗判定（见 _startLiveWatchdog）。
+          // 直播断流大多只有 error 事件、没有 EOF；恢复由预算 + 节流兜住
+          // （每 10 s 最多一次，10 分钟内最多 6 次）。
           if (kDebugMode) {
             debugPrint(
               'live error: $event; pos=${position.value} '
               'buffering=${isBuffering.value} buffered=${buffered.value}',
             );
           }
+          EasyThrottle.throttle(
+            'liveStream.recover',
+            const Duration(seconds: 10),
+            () {
+              _recoverLive(event);
+            },
+          );
           return;
         }
         if (event.startsWith("Failed to open https://") ||
@@ -1227,14 +1237,14 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     if (_liveRecovering || !isLive || _playerCount == 0) return;
     // 刚 open 过（含用户手动切线）：先让新源自己缓冲，别抢着重开
     final now = DateTime.now();
-    if (now.difference(_liveOpenedAt) < const Duration(seconds: 12)) {
+    if (now.difference(_liveOpenedAt) < const Duration(seconds: 5)) {
       return;
     }
     if (now.difference(_liveRecoverWindow) > const Duration(minutes: 10)) {
       _liveRecoverWindow = now;
       _liveRecoverCount = 0;
     }
-    if (_liveRecoverCount >= 3) {
+    if (_liveRecoverCount >= 6) {
       if (!_liveRecoverGaveUp) {
         _liveRecoverGaveUp = true;
         SmartDialog.showToast('直播流多次中断，已停止自动恢复，请手动刷新');
@@ -1247,7 +1257,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     // 这里不再把"调用返回"当成已恢复。
     // 冷却 + 抖动：不要让恢复请求形成固定节律
     _liveRetryAfter = now.add(
-      Duration(seconds: 20 + (now.millisecond % 1000) ~/ 250),
+      Duration(milliseconds: 10000 + (now.millisecond % 500)),
     );
     try {
       final cb = onLiveStall;
