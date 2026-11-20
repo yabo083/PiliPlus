@@ -156,6 +156,10 @@ class LiveMessageStream {
   static final _zlib = ZLibDecoder();
 
   bool _active = true;
+  bool _closed = false;
+  int _retry = 0;
+  bool _waitingAck = false;
+  Timer? _reconnectTimer;
   WebSocketChannel? _channel;
   StreamSubscription? _socketSubscription;
   Timer? _timer;
@@ -203,13 +207,40 @@ class LiveMessageStream {
       //   ..d('$logTag ===> 发送认证包');
       _socketSubscription = _channel?.stream.listen(
         onData,
-        onDone: close,
-        onError: (_) => close(),
+        onDone: _onSocketClosed,
+        onError: (_) => _onSocketClosed(),
       );
+      _waitingAck = false;
       _channel?.sink.add(authPackage.marshal());
     } catch (e) {
-      SmartDialog.showToast("弹幕地址链接失败: $e");
+      if (kDebugMode) logger.i("$logTag init failed: $e");
+      if (_retry == 0 && !_closed) {
+        SmartDialog.showToast("弹幕地址链接失败: $e");
+      }
+      _onSocketClosed();
     }
+  }
+
+  /// 连接断开 / 认证失败 / 心跳无回应时进入：拆掉旧连接并按指数退避重连。
+  void _onSocketClosed() {
+    if (_closed) return;
+    _waitingAck = false;
+    _timer?.cancel();
+    _timer = null;
+    _socketSubscription?.cancel();
+    _socketSubscription = null;
+    _channel?.sink.close();
+    _channel = null;
+    _retry = _retry >= 5 ? 5 : _retry + 1;
+    final delay = Duration(seconds: 1 << _retry);
+    _reconnectTimer?.cancel();
+    if (kDebugMode) {
+      logger.i("$logTag reconnect in ${delay.inSeconds}s (#$_retry)");
+    }
+    _reconnectTimer = Timer(delay, () {
+      if (_closed) return;
+      init();
+    });
   }
 
   @pragma('vm:notify-debugger-on-exception')
@@ -245,6 +276,7 @@ class LiveMessageStream {
       return;
     }
     if (kDebugMode) logger.i("$logTag 直播间信息流认证成功 $hashCode");
+    _retry = 0;
     int heartBeatCount = 1;
     _timer ??= Timer.periodic(const Duration(seconds: 30), (timer) {
       if (!_active) {
@@ -253,6 +285,14 @@ class LiveMessageStream {
         close();
         return;
       }
+      if (_waitingAck) {
+        // 上一拍心跳没等到 op=3 回包：连接已半死（TCP 未断但流已停），重连
+        if (kDebugMode) logger.i("$logTag heartBeat ack timeout $hashCode");
+        timer.cancel();
+        _onSocketClosed();
+        return;
+      }
+      _waitingAck = true;
       if (kDebugMode) logger.i("$logTag heartBeat $hashCode");
       final package = HeartbeatPackage(
         header: PackageHeader(
@@ -265,6 +305,8 @@ class LiveMessageStream {
         _channel?.sink.add(package.marshal());
       } catch (_) {
         timer.cancel();
+        _onSocketClosed();
+        return;
       }
       heartBeatCount++;
     });
@@ -279,7 +321,10 @@ class LiveMessageStream {
     final header = PackageHeaderRes.fromBytesData(data as Uint8List);
     if (header != null) {
       //心跳包回复不用处理
-      if (header.operationCode == 3) return;
+      if (header.operationCode == 3) {
+        _waitingAck = false;
+        return;
+      }
       if (header.operationCode == 8) {
         _heartBeat();
       }
@@ -312,7 +357,11 @@ class LiveMessageStream {
 
   void close() {
     _active = false;
+    _closed = true;
+    _waitingAck = false;
     if (kDebugMode) logger.i("$logTag close $hashCode");
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
     _timer?.cancel();
     _timer = null;
     _eventListeners.clear();

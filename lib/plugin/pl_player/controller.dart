@@ -921,9 +921,14 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     final Map<String, String> extras = {
       if (dataSource is FileSource)
         'cache': 'no'
-      else if (isLive)
-        ...liveBuffer
-      else
+      else if (isLive) ...{
+        ...liveBuffer,
+        // 直播 HLS 每 1s 一个分片；iOS 上分片请求会新建 TCP/TLS 连接，
+        // 复用失败时旧连接不回收，连接数随播放时长线性增长直到句柄耗尽。
+        // 关闭持久连接让每次请求结束即关闭（socket 级 FIN），阻断累积。
+        'demuxer-lavf-o': 'http_persistent=0',
+        'stream-lavf-o': 'multiple_requests=0',
+      } else
         ...buffer,
       'video-rotate': ?rotate?.toString(),
     };
@@ -990,6 +995,14 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   List<StreamSubscription>? _subscriptions;
   final Set<ValueChanged<Duration>> _positionListeners = {};
   final Set<ValueChanged<PlayerStatus>> _statusListeners = {};
+
+  /// 直播断流兜底：由直播间控制器注入（重新取流并 open），
+  /// 为空时退化为 refreshPlayer()。
+  Future<void> Function()? onLiveStall;
+  Timer? _liveWatchdog;
+  int _liveLastPos = -1;
+  DateTime _liveLastPosAt = DateTime.now();
+  bool _liveRecovering = false;
 
   Timer? _wakeLockTimer;
 
@@ -1078,6 +1091,11 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       stream.position.listen((Duration position) {
         final posInSeconds = position.inSeconds;
 
+        if (isLive && posInSeconds != _liveLastPos) {
+          _liveLastPos = posInSeconds;
+          _liveLastPosAt = DateTime.now();
+        }
+
         if (posInSeconds != this.position.value) {
           if (posInSeconds == 0 && playerStatus.isPlaying) {
             _updatePlaybackState(position: position);
@@ -1123,11 +1141,13 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
           return;
         }
         if (isLive) {
-          if (event.startsWith('tcp: ffurl_read returned ') ||
-              event.startsWith("Failed to open https://") ||
-              event.startsWith("Can not open external file https://")) {
-            Timer(const Duration(milliseconds: 3000), refreshPlayer);
-          }
+          // 直播任何错误都交给兜底：重新向服务端取流，而不是重开旧地址
+          // （旧地址/旧 CDN 已失效时重开只会继续失败）。
+          EasyThrottle.throttle(
+            'liveStream.recover',
+            const Duration(seconds: 10),
+            () => _recoverLive(event),
+          );
           return;
         }
         if (event.startsWith("Failed to open https://") ||
@@ -1170,10 +1190,47 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         }
       }),
     ];
+    _startLiveWatchdog();
+  }
+
+  /// 直播看门狗：正常播放时 position 会持续推进；直播流 EOF/断流时
+  /// mpv 会停在原地且多数情况下不报错，这里兜底重新取流。
+  void _startLiveWatchdog() {
+    _liveWatchdog?.cancel();
+    _liveWatchdog = null;
+    if (!isLive) return;
+    _liveLastPos = position.value;
+    _liveLastPosAt = DateTime.now();
+    _liveWatchdog = Timer.periodic(const Duration(seconds: 5), (_) {
+      if (!isLive || _liveRecovering) return;
+      if (!playerStatus.isPlaying) return;
+      if (DateTime.now().difference(_liveLastPosAt).inSeconds < 25) return;
+      _recoverLive('stall');
+    });
+  }
+
+  Future<void> _recoverLive(String reason) async {
+    if (_liveRecovering || !isLive || _playerCount == 0) return;
+    _liveRecovering = true;
+    try {
+      final cb = onLiveStall;
+      if (cb != null) {
+        await cb();
+      } else {
+        await refreshPlayer();
+      }
+      _liveLastPosAt = DateTime.now();
+    } catch (e) {
+      if (kDebugMode) debugPrint('live recover failed($reason): $e');
+    } finally {
+      _liveRecovering = false;
+    }
   }
 
   /// 移除事件监听
   void _removeListeners() {
+    _liveWatchdog?.cancel();
+    _liveWatchdog = null;
     _subscriptions?.forEach((e) => e.cancel());
     _subscriptions?.clear();
     _subscriptions = null;

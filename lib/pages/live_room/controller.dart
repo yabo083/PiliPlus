@@ -126,6 +126,7 @@ class LiveRoomController extends GetxController
     if (videoUrl == null) {
       return null;
     }
+    plPlayerController.onLiveStall = _recoverLiveStream;
     return plPlayerController.setDataSource(
       NetworkSource(videoSource: videoUrl!, audioSource: null),
       isLive: true,
@@ -244,6 +245,34 @@ class LiveRoomController extends GetxController
     return playerInit()?.whenComplete(_startSizeSub);
   }
 
+  /// 直播断流兜底：重新向服务端要播放地址再 open。
+  /// 不走 refreshPlayer()，因为旧地址（含 CDN 签名/线路）可能已经不可用。
+  Future<void> _recoverLiveStream() async {
+    if (isClosed) return;
+    final res = await LiveHttp.liveRoomInfo(
+      roomId: roomId,
+      qn: currentQn.value?.code,
+      onlyAudio: plPlayerController.onlyPlayAudio.value,
+    );
+    if (isClosed) return;
+    if (res case Success(:final response)) {
+      final playurl = response.playurlInfo?.playurl;
+      if (playurl == null) return;
+      if (response.roomId case final id?) {
+        roomId = id;
+      }
+      ruid = response.uid;
+      stream = playurl.stream;
+      _initStreamIndex();
+      await initLiveUrl(
+        streamIndex: streamIndex,
+        formatIndex: formatIndex,
+        codecIndex: codecIndex,
+        liveUrlIndex: liveUrlIndex,
+      );
+    }
+  }
+
   Future<void> queryLiveInfoH5() async {
     final res = await LiveHttp.liveRoomInfoH5(roomId: roomId);
     if (res case Success(:final response)) {
@@ -287,6 +316,7 @@ class LiveRoomController extends GetxController
 
   @override
   void onClose() {
+    plPlayerController.onLiveStall = null;
     stopService();
     super.onClose();
   }
