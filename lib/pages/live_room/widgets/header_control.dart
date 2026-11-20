@@ -412,9 +412,9 @@ class _LiveHeaderControlState extends State<LiveHeaderControl>
                                     selected: isCurrUrl,
                                     onTap: isCurrUrl
                                         ? null
-                                        : () {
+                                        : () async {
                                             Get.back();
-                                            controller.initLiveUrl(
+                                            await controller.initLiveUrl(
                                               streamIndex: si,
                                               formatIndex: fi,
                                               codecIndex: ci,
@@ -426,6 +426,7 @@ class _LiveHeaderControlState extends State<LiveHeaderControl>
                                                 stream.protocolName!,
                                                 format.formatName!,
                                                 codec.codecName!,
+                                                ui.toString(),
                                               ],
                                             );
                                           },

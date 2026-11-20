@@ -727,6 +727,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     try {
       _processing = true;
       this.isLive = isLive;
+      _wantsPlayback = autoplay;
       _videoType = videoType ?? VideoType.ugc;
       this.width = width;
       this.height = height;
@@ -776,6 +777,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       }
 
       await _initializePlayer();
+      _liveOpenedAt = DateTime.now();
+      _startLiveWatchdog();
       onInit?.call();
     } catch (err, stackTrace) {
       dataStatus.value = DataStatus.error;
@@ -926,8 +929,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         // 直播 HLS 每 1s 一个分片；iOS 上分片请求会新建 TCP/TLS 连接，
         // 复用失败时旧连接不回收，连接数随播放时长线性增长直到句柄耗尽。
         // 关闭持久连接让每次请求结束即关闭（socket 级 FIN），阻断累积。
+        // hls 分片请求的 dict 在 libavformat/hls.c 内部构造，stream-lavf-o
+        // 作用不到那里；只保留 demuxer 层的 persistent 开关。
         'demuxer-lavf-o': 'http_persistent=0',
-        'stream-lavf-o': 'multiple_requests=0',
       } else
         ...buffer,
       'video-rotate': ?rotate?.toString(),
@@ -996,13 +1000,19 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   final Set<ValueChanged<Duration>> _positionListeners = {};
   final Set<ValueChanged<PlayerStatus>> _statusListeners = {};
 
-  /// 直播断流兜底：由直播间控制器注入（重新取流并 open），
-  /// 为空时退化为 refreshPlayer()。
-  Future<void> Function()? onLiveStall;
+  /// 直播断流兜底：由直播间控制器注入（重新取流并 open）。
+  /// 返回 true 表示本次有效源已提交（dataStatus == loaded）。
+  Future<bool> Function()? onLiveStall;
   Timer? _liveWatchdog;
   int _liveLastPos = -1;
   DateTime _liveLastPosAt = DateTime.now();
+  DateTime _liveRetryAfter = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime _liveOpenedAt = DateTime.fromMillisecondsSinceEpoch(0);
   bool _liveRecovering = false;
+
+  /// 用户意图：true 表示用户希望正在播放（暂停、后台、退出时为 false）。
+  /// 不能用 mpv 上报的 playing 代替——直播 EOF 时 mpv 会自己置 paused。
+  bool _wantsPlayback = false;
 
   Timer? _wakeLockTimer;
 
@@ -1141,13 +1151,15 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
           return;
         }
         if (isLive) {
-          // 直播任何错误都交给兜底：重新向服务端取流，而不是重开旧地址
-          // （旧地址/旧 CDN 已失效时重开只会继续失败）。
-          EasyThrottle.throttle(
-            'liveStream.recover',
-            const Duration(seconds: 10),
-            () => _recoverLive(event),
-          );
+          // mpv 会把 ffmpeg 的 error 级日志（TLS 读 EOF、单分片截断等）
+          // 转发到这里，绝大多数不代表整路已断；这里只记录信号，
+          // 是否真的断流由位置看门狗判定（见 _startLiveWatchdog）。
+          if (kDebugMode) {
+            debugPrint(
+              'live error: $event; pos=${position.value} '
+              'buffering=${isBuffering.value} buffered=${buffered.value}',
+            );
+          }
           return;
         }
         if (event.startsWith("Failed to open https://") ||
@@ -1190,11 +1202,11 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         }
       }),
     ];
-    _startLiveWatchdog();
   }
 
-  /// 直播看门狗：正常播放时 position 会持续推进；直播流 EOF/断流时
-  /// mpv 会停在原地且多数情况下不报错，这里兜底重新取流。
+  /// 直播看门狗：每代媒体 open 成功后由 setDataSource 启动。
+  /// 正常播放时 position 持续推进；直播 EOF/断流时 mpv 可能静默停在原地
+  /// （甚至自己置 paused/completed），这里按"用户仍想播放 + 持续无进度"兜底。
   void _startLiveWatchdog() {
     _liveWatchdog?.cancel();
     _liveWatchdog = null;
@@ -1202,24 +1214,37 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     _liveLastPos = position.value;
     _liveLastPosAt = DateTime.now();
     _liveWatchdog = Timer.periodic(const Duration(seconds: 5), (_) {
-      if (!isLive || _liveRecovering) return;
-      if (!playerStatus.isPlaying) return;
-      if (DateTime.now().difference(_liveLastPosAt).inSeconds < 25) return;
-      _recoverLive('stall');
+      if (!isLive || !_wantsPlayback || _liveRecovering) return;
+      if (!visible) return;
+      if (DateTime.now().isBefore(_liveRetryAfter)) return;
+      final stalled = DateTime.now().difference(_liveLastPosAt).inSeconds;
+      final eof = playerStatus == PlayerStatus.completed;
+      if (!eof && stalled < 25) return;
+      _recoverLive(eof ? 'eof' : 'stall(${stalled}s)');
     });
   }
 
   Future<void> _recoverLive(String reason) async {
     if (_liveRecovering || !isLive || _playerCount == 0) return;
+    // 刚 open 过（含用户手动切线）：先让新源自己缓冲，别抢着重开
+    if (DateTime.now().difference(_liveOpenedAt) <
+        const Duration(seconds: 12)) {
+      return;
+    }
     _liveRecovering = true;
+    // 失败重试冷却；成功与否都靠 position 是否真的推进来判定，
+    // 这里不再把"调用返回"当成已恢复。
+    _liveRetryAfter = DateTime.now().add(const Duration(seconds: 15));
     try {
       final cb = onLiveStall;
+      var ok = false;
       if (cb != null) {
-        await cb();
+        ok = await cb();
       } else {
-        await refreshPlayer();
+        final f = refreshPlayer();
+        if (f != null) await f;
       }
-      _liveLastPosAt = DateTime.now();
+      if (kDebugMode) debugPrint('live recover($reason) -> $ok');
     } catch (e) {
       if (kDebugMode) debugPrint('live recover failed($reason): $e');
     } finally {
@@ -1286,6 +1311,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
 
     audioSessionHandler?.setActive(true);
 
+    _wantsPlayback = true;
+    _liveLastPosAt = DateTime.now();
     playerStatus = .playing;
   }
 
@@ -1293,6 +1320,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   Future<void> pause({bool notify = true, bool isInterrupt = false}) async {
     await _videoPlayerController?.pause();
     playerStatus = .paused;
+    // 仅把用户主动暂停当作意图变化；内部切源时的 pause(notify: false) 不算
+    if (notify) {
+      _wantsPlayback = false;
+    }
 
     // 主动暂停时让出音频焦点
     if (!isInterrupt) {

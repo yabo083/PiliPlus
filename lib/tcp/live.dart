@@ -157,6 +157,7 @@ class LiveMessageStream {
 
   bool _active = true;
   bool _closed = false;
+  bool _connecting = false;
   int _retry = 0;
   bool _waitingAck = false;
   Timer? _reconnectTimer;
@@ -166,6 +167,9 @@ class LiveMessageStream {
   static const String logTag = "LiveStreamService";
 
   Future<void> init() async {
+    // 单飞：已经连着或正在拨号时不重复发起
+    if (_closed || _connecting || _channel != null) return;
+    _connecting = true;
     final authPackage = AuthPackage(
       header: const PackageHeader(
         protocolVer: 1,
@@ -196,28 +200,32 @@ class LiveMessageStream {
         throw Exception("all servers connect failed");
       }
 
-      _channel = await getSocket();
-      if (!_active) {
-        if (kDebugMode) logger.i("$logTag init inactive $hashCode");
-        close();
+      final ch = await getSocket();
+      if (_closed) {
+        await ch.sink.close();
         return;
       }
-      // logger
-      //   ..d('$logTag ===> TCP连接建立')
-      //   ..d('$logTag ===> 发送认证包');
-      _socketSubscription = _channel?.stream.listen(
+      _channel = ch;
+      // 回调带连接身份：旧连接的迟到事件不能关掉新连接
+      _socketSubscription = ch.stream.listen(
         onData,
-        onDone: _onSocketClosed,
-        onError: (_) => _onSocketClosed(),
+        onDone: () {
+          if (identical(_channel, ch)) _onSocketClosed();
+        },
+        onError: (_) {
+          if (identical(_channel, ch)) _onSocketClosed();
+        },
       );
       _waitingAck = false;
-      _channel?.sink.add(authPackage.marshal());
+      ch.sink.add(authPackage.marshal());
     } catch (e) {
       if (kDebugMode) logger.i("$logTag init failed: $e");
       if (_retry == 0 && !_closed) {
         SmartDialog.showToast("弹幕地址链接失败: $e");
       }
       _onSocketClosed();
+    } finally {
+      _connecting = false;
     }
   }
 

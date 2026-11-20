@@ -29,6 +29,7 @@ import 'package:PiliPlus/pages/live_room/send_danmaku/view.dart';
 import 'package:PiliPlus/pages/video/widgets/header_control.dart';
 import 'package:PiliPlus/plugin/pl_player/controller.dart';
 import 'package:PiliPlus/plugin/pl_player/models/data_source.dart';
+import 'package:PiliPlus/plugin/pl_player/models/data_status.dart';
 import 'package:PiliPlus/plugin/pl_player/utils/danmaku_options.dart';
 import 'package:PiliPlus/services/logger.dart' show logger;
 import 'package:PiliPlus/services/service_locator.dart';
@@ -96,6 +97,13 @@ class LiveRoomController extends GetxController
   @override
   final plPlayerController = PlPlayerController.getInstance(isLive: true);
 
+  /// 切源版本号：每次 initLiveUrl（手动切线/切画质/自动恢复）递增，
+  /// 用来丢弃过期的自动恢复结果。
+  int _sourceRev = 0;
+
+  /// 稳定回调引用（方法 tear-off 每次都是新闭包，不能用 identical 比较）
+  late final Future<bool> Function() _stallCb = _recoverLiveStream;
+
   void startService({bool startDM = true}) {
     _startLiveTimeTimer();
     _startLiveTraceTimer();
@@ -126,7 +134,7 @@ class LiveRoomController extends GetxController
     if (videoUrl == null) {
       return null;
     }
-    plPlayerController.onLiveStall = _recoverLiveStream;
+    plPlayerController.onLiveStall = _stallCb;
     return plPlayerController.setDataSource(
       NetworkSource(videoSource: videoUrl!, audioSource: null),
       isLive: true,
@@ -196,28 +204,25 @@ class LiveRoomController extends GetxController
 
   void _initStreamIndex() {
     final pref = Pref.liveStream;
-    if (pref != null) {
-      try {
-        final String protocolName = pref[0];
-        final String formatName = pref[1];
-        final String codecName = pref[2];
-        for (var (i, s) in stream.indexed) {
-          if (s.protocolName == protocolName) {
-            streamIndex = i;
-            for (var (j, f) in s.format.indexed) {
-              if (f.formatName == formatName) {
-                formatIndex = j;
-                for (var (k, c) in f.codec.indexed) {
-                  if (c.codecName == codecName) {
-                    codecIndex = k;
-                    return;
-                  }
-                }
-              }
-            }
+    if (pref is! List || pref.length < 3) return;
+    // 只在三元组完全匹配时一次性提交索引；部分匹配会把 streamIndex
+    // 改掉而 format/codec 仍是旧值，getOrFirst 静默 clamp 后串到别的线路。
+    for (var (i, s) in stream.indexed) {
+      if (s.protocolName != pref[0]) continue;
+      for (var (j, f) in s.format.indexed) {
+        if (f.formatName != pref[1]) continue;
+        for (var (k, c) in f.codec.indexed) {
+          if (c.codecName != pref[2]) continue;
+          streamIndex = i;
+          formatIndex = j;
+          codecIndex = k;
+          if (pref.length > 3) {
+            final host = int.tryParse('${pref[3]}');
+            if (host != null) liveUrlIndex = host;
           }
+          return;
         }
-      } catch (_) {}
+      }
     }
   }
 
@@ -227,6 +232,7 @@ class LiveRoomController extends GetxController
     int codecIndex = 0,
     int liveUrlIndex = 0,
   }) {
+    _sourceRev++;
     this.streamIndex = streamIndex;
     this.formatIndex = formatIndex;
     this.codecIndex = codecIndex;
@@ -247,29 +253,74 @@ class LiveRoomController extends GetxController
 
   /// 直播断流兜底：重新向服务端要播放地址再 open。
   /// 不走 refreshPlayer()，因为旧地址（含 CDN 签名/线路）可能已经不可用。
-  Future<void> _recoverLiveStream() async {
-    if (isClosed) return;
+  Future<bool> _recoverLiveStream() async {
+    if (isClosed || !isLoaded.value) return false;
+    // 请求发出时刻的切源版本：期间用户手动切线/切画质/切房间都会递增，
+    // 过期结果一律丢弃，避免自动恢复把用户的新选择顶掉。
+    final rev = _sourceRev;
+    final wantedHost = _currentHost();
     final res = await LiveHttp.liveRoomInfo(
       roomId: roomId,
       qn: currentQn.value?.code,
       onlyAudio: plPlayerController.onlyPlayAudio.value,
     );
-    if (isClosed) return;
+    if (isClosed || rev != _sourceRev) return false;
     if (res case Success(:final response)) {
+      if (response.liveStatus != 1) return false;
       final playurl = response.playurlInfo?.playurl;
-      if (playurl == null) return;
+      if (playurl == null) return false;
+      final streams = playurl.stream;
+      if (streams.isEmpty) return false;
+      ruid = response.uid;
       if (response.roomId case final id?) {
         roomId = id;
       }
-      ruid = response.uid;
-      stream = playurl.stream;
+      stream = streams;
       _initStreamIndex();
+      // 新响应可能换序/少线路：按原 host 身份找回同一线路，找不到才回落
+      final infos = streams
+          .getOrFirst(streamIndex)
+          .format
+          .getOrFirst(formatIndex)
+          .codec
+          .getOrFirst(codecIndex)
+          .urlInfo;
+      if (infos.isEmpty) return false;
+      final match = wantedHost == null
+          ? -1
+          : infos.indexWhere((u) => u.host == wantedHost);
+      liveUrlIndex = match >= 0
+          ? match
+          : (liveUrlIndex < infos.length ? liveUrlIndex : 0);
       await initLiveUrl(
         streamIndex: streamIndex,
         formatIndex: formatIndex,
         codecIndex: codecIndex,
         liveUrlIndex: liveUrlIndex,
       );
+      return !isClosed &&
+          videoUrl != null &&
+          plPlayerController.dataStatus.value == DataStatus.loaded;
+    }
+    // 取流失败：至少重开旧地址，别把播放器留在空状态
+    final f = plPlayerController.refreshPlayer();
+    if (f != null) await f;
+    return false;
+  }
+
+  String? _currentHost() {
+    try {
+      final infos = stream
+          .getOrFirst(streamIndex)
+          .format
+          .getOrFirst(formatIndex)
+          .codec
+          .getOrFirst(codecIndex)
+          .urlInfo;
+      if (infos.isEmpty) return null;
+      return infos[liveUrlIndex < infos.length ? liveUrlIndex : 0].host;
+    } catch (_) {
+      return null;
     }
   }
 
@@ -316,7 +367,9 @@ class LiveRoomController extends GetxController
 
   @override
   void onClose() {
-    plPlayerController.onLiveStall = null;
+    if (identical(plPlayerController.onLiveStall, _stallCb)) {
+      plPlayerController.onLiveStall = null;
+    }
     stopService();
     super.onClose();
   }

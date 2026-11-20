@@ -106,7 +106,10 @@ abstract final class VideoUtils {
 
   static String getLiveCdnUrl(CodecItem e, {int index = 0}) {
     final urlInfo = e.urlInfo.getOrFirst(index);
-    return (liveCdnUrl ?? urlInfo.host) + e.baseUrl + urlInfo.extra;
+    // index > 0 表示用户显式选了线路，必须用该线路 host：liveCdnUrl 覆盖
+    // 会让 extra 里的 cdn/签名与 host 失配（同类问题见 #3242）。
+    final host = index > 0 ? urlInfo.host : (liveCdnUrl ?? urlInfo.host);
+    return host + e.baseUrl + urlInfo.extra;
   }
 
   static VideoDecodeFormatType selectCodec(
