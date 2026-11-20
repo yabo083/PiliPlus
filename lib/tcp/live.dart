@@ -239,8 +239,16 @@ class LiveMessageStream {
     _socketSubscription = null;
     _channel?.sink.close();
     _channel = null;
-    _retry = _retry >= 5 ? 5 : _retry + 1;
-    final delay = Duration(seconds: 1 << _retry);
+    // 最多 6 次，退避 2/4/8/16/32/32 s + 0~1 s 抖动：
+    // 弹幕重连也是被服务端风控观察的行为，不能让它变成固定节律。
+    if (_retry >= 6) {
+      if (kDebugMode) logger.i("$logTag give up reconnecting $hashCode");
+      return;
+    }
+    _retry++;
+    final base = _retry >= 5 ? 32 : 1 << _retry;
+    final jitter = DateTime.now().millisecond % 1000;
+    final delay = Duration(milliseconds: base * 1000 + jitter);
     _reconnectTimer?.cancel();
     if (kDebugMode) {
       logger.i("$logTag reconnect in ${delay.inSeconds}s (#$_retry)");

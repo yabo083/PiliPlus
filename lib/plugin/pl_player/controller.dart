@@ -728,6 +728,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       _processing = true;
       this.isLive = isLive;
       _wantsPlayback = autoplay;
+      _liveRecoverCount = 0;
+      _liveRecoverGaveUp = false;
       _videoType = videoType ?? VideoType.ugc;
       this.width = width;
       this.height = height;
@@ -924,15 +926,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     final Map<String, String> extras = {
       if (dataSource is FileSource)
         'cache': 'no'
-      else if (isLive) ...{
-        ...liveBuffer,
-        // 直播 HLS 每 1s 一个分片；iOS 上分片请求会新建 TCP/TLS 连接，
-        // 复用失败时旧连接不回收，连接数随播放时长线性增长直到句柄耗尽。
-        // 关闭持久连接让每次请求结束即关闭（socket 级 FIN），阻断累积。
-        // hls 分片请求的 dict 在 libavformat/hls.c 内部构造，stream-lavf-o
-        // 作用不到那里；只保留 demuxer 层的 persistent 开关。
-        'demuxer-lavf-o': 'http_persistent=0',
-      } else
+      else if (isLive) ...liveBuffer
+      else
         ...buffer,
       'video-rotate': ?rotate?.toString(),
     };
@@ -1008,6 +1003,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   DateTime _liveLastPosAt = DateTime.now();
   DateTime _liveRetryAfter = DateTime.fromMillisecondsSinceEpoch(0);
   DateTime _liveOpenedAt = DateTime.fromMillisecondsSinceEpoch(0);
+  // 自动恢复的预算：10 分钟内最多 3 次，避免异常时对服务端形成高频重取
+  int _liveRecoverCount = 0;
+  DateTime _liveRecoverWindow = DateTime.fromMillisecondsSinceEpoch(0);
+  bool _liveRecoverGaveUp = false;
   bool _liveRecovering = false;
 
   /// 用户意图：true 表示用户希望正在播放（暂停、后台、退出时为 false）。
@@ -1227,14 +1226,29 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   Future<void> _recoverLive(String reason) async {
     if (_liveRecovering || !isLive || _playerCount == 0) return;
     // 刚 open 过（含用户手动切线）：先让新源自己缓冲，别抢着重开
-    if (DateTime.now().difference(_liveOpenedAt) <
-        const Duration(seconds: 12)) {
+    final now = DateTime.now();
+    if (now.difference(_liveOpenedAt) < const Duration(seconds: 12)) {
       return;
     }
+    if (now.difference(_liveRecoverWindow) > const Duration(minutes: 10)) {
+      _liveRecoverWindow = now;
+      _liveRecoverCount = 0;
+    }
+    if (_liveRecoverCount >= 3) {
+      if (!_liveRecoverGaveUp) {
+        _liveRecoverGaveUp = true;
+        SmartDialog.showToast('直播流多次中断，已停止自动恢复，请手动刷新');
+      }
+      return;
+    }
+    _liveRecoverCount++;
     _liveRecovering = true;
     // 失败重试冷却；成功与否都靠 position 是否真的推进来判定，
     // 这里不再把"调用返回"当成已恢复。
-    _liveRetryAfter = DateTime.now().add(const Duration(seconds: 15));
+    // 冷却 + 抖动：不要让恢复请求形成固定节律
+    _liveRetryAfter = now.add(
+      Duration(seconds: 20 + (now.millisecond % 1000) ~/ 250),
+    );
     try {
       final cb = onLiveStall;
       var ok = false;
@@ -1243,6 +1257,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       } else {
         final f = refreshPlayer();
         if (f != null) await f;
+      }
+      if (ok) {
+        _liveRecoverCount = 0;
+        _liveRecoverGaveUp = false;
       }
       if (kDebugMode) debugPrint('live recover($reason) -> $ok');
     } catch (e) {
